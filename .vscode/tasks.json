@@ -1,0 +1,63 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build minidbg",
+            "type": "shell",
+            "command": "gcc",
+            "args": [
+                "-Wall",
+                "-g",
+                "-o",
+                "minidbg",
+                "minidbg_v1.c"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "detail": "编译调试器本体"
+        },
+        {
+            "label": "build testprogram",
+            "type": "shell",
+            "command": "gcc",
+            "args": [
+                "-Wall",
+                "-g",
+                "-o",
+                "testprogram",
+                "testprogram.c"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "build",
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "detail": "编译被调试的测试程序"
+        },
+        {
+            "label": "运行 minidbg",
+            "type": "shell",
+            "command": "gcc -Wall -g -o minidbg minidbg_v1.c && ./minidbg",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": true
+            },
+            "detail": "编译并在终端里直接运行（可输入 s/x/q 交互）"
+        }
+    ]
+}

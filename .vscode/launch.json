@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "调试 minidbg",
+            "type": "gdb",
+            "request": "launch",
+            "target": "${workspaceFolder}/minidbg",
+            "cwd": "${workspaceFolder}",
+            "valuesFormatting": "parseText",
+            "preLaunchTask": "build minidbg"
+        },
+        {
+            "name": "单独调试 testprogram",
+            "type": "gdb",
+            "request": "launch",
+            "target": "${workspaceFolder}/testprogram",
+            "cwd": "${workspaceFolder}",
+            "valuesFormatting": "parseText",
+            "preLaunchTask": "build testprogram"
+        }
+    ]
+}
