@@ -1,0 +1,19 @@
+# 编译产物
+a.out
+minidbg
+testprogram
+testprogram_nopie
+test_bt_nopie
+*.o
+
+# 开发副本(git 历史已记录演进,工作副本不进仓库)
+minidbg_v*.c
+
+# 编辑器垃圾
+*.swp
+*.swm
+*.swn
+*.swo
+
+# 杂项
+core

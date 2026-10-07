@@ -1,0 +1,87 @@
+digraph minidbg {
+  rankdir=TB;
+  bgcolor="white";
+  node [shape=box, style="rounded,filled", fillcolor="#fdf6e3", fontname="Droid Sans Fallback", fontsize=11, margin="0.1,0.05"];
+  edge [color=red, penwidth=2.2, fontname="Droid Sans Fallback", fontsize=10];
+
+  child [label="子进程 testprogram\n(被调试的目标)", shape=ellipse, fillcolor="#e8f4e8", fontsize=13];
+
+  subgraph cluster_main {
+    label="调度核心 main() —— 双循环状态机 (218-314行)";
+    style="dashed";
+    first_stop [label="① 第一次停(exec握手)\nPEEK存字节→bp_add→POKE埋0xCC\nsym_load加载符号表\nCONT放行"];
+    main_hit [label="② 第二次停(撞上main断点)\n恢复三件套: rip-1 / 还原字节 / 删断点"];
+    general [label="③ 之后的每次停\nrip-1查断点表:\n  是temp断点→恢复+删项+报\"步过完成\"\n  不是→打印当前rip"];
+    prompt [label="④ prompt小循环\nscanf→查CMDS表→调handler\nquit: 0回waitpid / 1退出 / 2继续问", fillcolor="#e8e8f4"];
+  }
+
+  subgraph cluster_cmd {
+    label="系统3 命令系统 (126-216行) —— 表驱动: 加命令=表里加一行";
+    style="dashed";
+    cmds [label="CMDS[] 命令表\n{\"s\",cmd_s} {\"x\",cmd_x}\n{\"q\",cmd_q} {\"n\",cmd_n}\n{\"f\",cmd_f} {\"bt\",cmd_bt}", fillcolor="#e8e8f4"];
+    cmd_s [label="cmd_s 单步\nSINGLESTEP → return 0"];
+    cmd_x [label="cmd_x 放行\nCONT → return 0"];
+    cmd_q [label="cmd_q 退出\n确认→KILL→return 1\n取消→return 2"];
+    cmd_n [label="cmd_n 步过(运行类)\n首字节==0xE8?\n  是→bp_install(rip+5,temp)+CONT\n  否→退化SINGLESTEP"];
+    cmd_f [label="cmd_f 步出(运行类)\nPEEK(rbp+8)=返回地址\nbp_install(返回地址,temp)+CONT"];
+    cmd_bt [label="cmd_bt 栈回溯(查询类,return 2)\nwhile(walker!=0){\n  打印PEEK(walker+8) ← 返回地址\n  walker=PEEK(walker) ← 跳上一帧\n}"];
+  }
+
+  subgraph cluster_bp {
+    label="系统1 断点系统 (22-88行)";
+    style="dashed";
+    bp_install [label="bp_install(埋雷三合一)\nPEEK存原字节→POKE埋0xCC→bp_add入表\nis_temp: 1=一次性(命中即删)", fillcolor="#f4e8e8"];
+    bp_add [label="bp_add 入表\n先写items[count]再count++"];
+    bp_find [label="bp_find 按地址查表\n返回下标/-1"];
+    bp_remove [label="bp_remove 软删除\nactive=0"];
+  }
+
+  subgraph cluster_sym {
+    label="系统2 符号系统 (90-124行) —— nm作弊版";
+    style="dashed";
+    sym_load [label="sym_load\npopen(\"nm --defined-only -n\")\nsscanf切三字段,只收T/t\n存入SYMS[](升序)"];
+    sym_print [label="sym_print(addr)\n找最后≤addr的符号\n→\"函数名+0x偏移\"\n表尾越界/查不到→???"];
+    syms [label="SYMS[] 全局符号表\n{地址,名字}×4096", shape=cylinder, fillcolor="#e8f0f4"];
+  }
+
+  regs [label="regs 全局寄存器快照\n(GETREGS往这抄)", shape=cylinder, fillcolor="#e8f0f4"];
+  ptable [label="p 全局断点表\nbp_t items[16]", shape=cylinder, fillcolor="#e8f0f4"];
+
+  /* main 内部流向 */
+  first_stop -> main_hit [label="CONT后撞上", style=dashed, color=gray];
+  main_hit -> general [label="再之后每次停", style=dashed, color=gray];
+  general -> prompt;
+  prompt -> cmds [label="strcmp查表"];
+
+  /* 命令→动作 */
+  cmds -> cmd_s;  cmds -> cmd_x;  cmds -> cmd_q;
+  cmds -> cmd_n;  cmds -> cmd_f;  cmds -> cmd_bt;
+
+  /* handler→断点系统 */
+  cmd_n -> bp_install [label="rip+5, temp=1"];
+  cmd_f -> bp_install [label="返回地址, temp=1"];
+  bp_install -> bp_add;
+  first_stop -> bp_add;
+  main_hit -> bp_remove;
+  general -> bp_find [label="rip-1查表"];
+  general -> bp_remove [label="temp命中后删"];
+
+  /* 符号系统 */
+  first_stop -> sym_load [label="get_exe_path拿路径"];
+  sym_load -> syms;
+  sym_print -> syms [style=invis];
+  syms -> sym_print [label="查表"];
+  cmd_bt -> sym_print [label="翻译每帧地址"];
+
+  /* ptrace 通道(蓝色) */
+  edge [color=blue, penwidth=1.8];
+  cmd_s -> child [label="SINGLESTEP"];
+  cmd_x -> child [label="CONT"];
+  cmd_q -> child [label="KILL"];
+  bp_install -> child [label="PEEK/POKE 内存"];
+  cmd_bt -> child [label="PEEK 栈"];
+  child -> regs [label="GETREGS", style=dashed];
+  regs -> cmd_n [style=dashed, color=gray];
+  regs -> cmd_f [style=dashed, color=gray];
+  regs -> cmd_bt [style=dashed, color=gray];
+}
