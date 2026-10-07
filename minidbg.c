@@ -9,7 +9,13 @@
 #include <sys/wait.h> //waitpid
 #include <unistd.h>   //fork ,exec
 struct user_regs_struct regs;
+/* 改动21:永久断点"恢复→单步→重埋"接力标记。
+ * p_flag   : 待重埋的断点地址(0=没有中转停在途)。中转停时 rip 已跑远,地址只能靠它
+ * p_from_x : 标记是谁立的——1=cmd_x(重埋后CONT),0=cmd_s(重埋后回prompt)
+ * 为什么需要:单步完成和撞断点的 status 完全一样(都是 SIGTRAP),
+ * 主循环只能靠这个标记认出"这次停是中转站,不该去prompt" */
 long p_flag=0;
+int p_from_x=0;
 int get_exe_path(int pid, char *out, size_t outline) {//拿文件真实路径 为了
   char link[64];  //这个是用来存路径名字的
   snprintf(link, sizeof(link), "/proc/%d/exe", pid);
@@ -43,7 +49,7 @@ unsigned long get_load_base(int pid, const char *exe_path){//拿基址 模式就
   return base;
 }
 
-/* 改动18:基址修正量。所有跨世界换算的唯一参数:
+/* 改动18:基址修正量。沟通内存世界和文件世界换算的唯一参数:
  *   文件坐标 + g_base = 内存地址   (下断点,正方向)
  *   内存地址 - g_base = 文件坐标   (符号翻译,反方向)
  * nopie 下符号已是绝对地址,g_base 恒为 0 —— "nopie 就是基址为 0 的特例"在此落地 */
@@ -53,7 +59,7 @@ typedef struct{
   long save;
   int is_temp;
   int active;
-  int restored;/*永久断点已修复等待单步运行*/
+  int restored;/* 改动19:物理状态——0=armed(0xCC在内存里), 1=已恢复原字节,等单步抬过 */
 }bp_t;//断点结构
 #define BP_MAX 16
 typedef struct{
@@ -86,18 +92,26 @@ int  bp_find(bp_table_t *b,unsigned long addr){
   return -1;
 
 }
-void bp_add(bp_table_t *b,unsigned long addr,long save,int is_temp,int restored){
+/* 改动19修正:restored 收回 bp_add 内部初始化(恒为0——刚埋的断点0xCC在内存里,就是armed)。
+ * 你 v7 草稿里 bp_install 给永久断点传 restored=1 是反的:restored=1 的语义是
+ * "字节已恢复、在等单步",刚埋下时雷还在地里,必须是 0 */
+void bp_add(bp_table_t *b,unsigned long addr,long save,int is_temp){
 
   if(b->count>=BP_MAX){
     perror("b表已满！或已有addr存在\n");
     exit(1);
+  }
+  /* 改动23配套:同地址断点已存在就直接复用,不重复入表。
+   * 防的是审计bug#2:二次 install 时 PEEK 读到的 save 里已含 0xCC,入表会永久污染 */
+  if(bp_find(b,addr)>=0){
+    return;
   }
   /* 改动1:先写入 items[count],再 count++。原来反了,第一个断点会写到 items[1],items[0] 是垃圾 */
   b->items[b->count].save=save;
   b->items[b->count].addr=addr;
   b->items[b->count].active=1;
   b->items[b->count].is_temp=is_temp;
-  b->items[b->count].restored=restored;
+  b->items[b->count].restored=0;   /* 改动19:新断点必为 armed */
   b->count++;
 }
 void bp_remove(bp_table_t*b,unsigned long addr){
@@ -119,28 +133,51 @@ void bp_remove(bp_table_t*b,unsigned long addr){
 void bp_install(pid_t pid,bp_table_t *b,unsigned long addr,int is_temp){
   long save = mem_peek(pid, addr);           /* 改动13:走统一入口 */
   mem_poke(pid, addr, (save & ~0xffL) | 0xcc);
-  int restored=1;
-  if(is_temp){restored=0;}
-  bp_add(b,addr,save,is_temp,restored);
+  bp_add(b,addr,save,is_temp);
+}
+
+/* 改动20:永久断点命中时的"恢复"——写回原字节+标记restored,但不删表项。
+ * 和 bp_restore(改动15,temp/删表项用)的分工:p=permanent,保表项是因为
+ * addr/save 还要供重埋用。rip 回退不归这里管(在 bp_handle_hit 统一做) */
+void bp_prestore(pid_t pid, bp_table_t *b, int idx){
+  mem_poke(pid, b->items[idx].addr, b->items[idx].save);
+  b->items[idx].restored=1;
+}
+
+/* 改动20:重埋——把 0xCC 按原公式合成写回,restored 复位为 armed。
+ * 你 v7 草稿里这一步调用的 bp_prestored 有两个bug:下标用了 p.count(越界,
+ * 那是下一个空位不是目标项)、且只改了状态没碰字节。现在 POKE 和状态都在这 */
+void bp_replant(pid_t pid, bp_table_t *b, unsigned long addr){
+  int idx=bp_find(b,addr);
+  if(idx<0){ return; }   /* 防御:标记立着表项必然在,查不到就当无事发生 */
+  mem_poke(pid, addr, (b->items[idx].save & ~0xffL) | 0xcc);
+  b->items[idx].restored=0;
 }
 
 /* 改动14:命中检查+恢复,收口进断点模块。
  * 原来这段散在主循环 else 分支,直接摸 p.items[] 内部字段——断点的一生
  * (埋→命中→恢复→删)现在完整住在模块内。
  * 约定:调用前调用方已完成 GETREGS(全局 regs 是最新的)。
- * 命中临时断点:恢复原字节、regs.rip 回退并 SETREGS、删表项,返回 1;
- * 未命中(普通单步停下):返回 0。命中路径会更新全局 regs.rip,调用方直接打印即可 */
+ * 改动20:返回值升级为三态——0=未命中 / 1=命中临时断点(已恢复+删表项)
+ * / 2=命中永久断点(已恢复+rip回退,表项保留等重埋)。
+ * 命中路径都会更新全局 regs.rip,调用方直接打印即可 */
 int bp_handle_hit(pid_t pid, bp_table_t *b){
   int hit = bp_find(b, regs.rip - 1);
-  if(hit >= 0 && b->items[hit].is_temp){/*此处针对临时断点，暂未考虑永久断点*/
-    unsigned long bp_addr = b->items[hit].addr;
+  if(hit < 0) return 0;
+  unsigned long bp_addr = b->items[hit].addr;
+  if(b->items[hit].is_temp){
     mem_poke(pid, bp_addr, b->items[hit].save);   /* 改动13:走统一入口 */
     regs.rip -= 1;
     ptrace(PTRACE_SETREGS, pid, 0, &regs);
     bp_remove(b, bp_addr);
     return 1;
-  }/*考虑直接*/
-  return 0;
+  }
+  /* 永久断点:恢复+回退后回 prompt 交出现场(惰性方案)。
+   * 单步+重埋推迟到用户按 x/s 时,由 cmd_x/cmd_s 立标记、主循环中转停完成 */
+  bp_prestore(pid, b, hit);
+  regs.rip -= 1;
+  ptrace(PTRACE_SETREGS, pid, 0, &regs);
+  return 2;
 }
 
 /* 改动15:恢复原字节+删表项,给首次 main 断点命中用。
@@ -151,12 +188,6 @@ void bp_restore(pid_t pid, bp_table_t *b, unsigned long addr){
   if(idx < 0){ perror("bp_restore: 表中没有该断点"); exit(1); }
   mem_poke(pid, addr, b->items[idx].save);
   bp_remove(b, addr);
-}
-void bp_prestored(pid_t pid, bp_table_t *b, unsigned long addr){//单独处理永久断点避免 删表项
-  int idx=bp_find(b,addr);
-  if(idx<0){perror("未找到该永久断点");}
-  p.items[p.count].restored=0;
-  return;
 }
 /* 改动11:符号翻译胶水(作弊版) —— popen 调 nm 解析目标二进制的符号表。
  * bt 爬出来的是裸地址,靠它翻译成"函数名+0x偏移";查不到(如libc)就打 ???
@@ -220,13 +251,28 @@ typedef struct{
   int (*handler)(pid_t pid);
 }cmd_t;
 
-int cmd_s(pid_t pid){ ptrace(PTRACE_SINGLESTEP, pid, 0, 0); return 0; }
-int cmd_x(pid_t pid){ 
-  int q=0;
-  q=bp_find(&p,regs.rip);
-  if(q>=0&&p.items[q].restored){//判断是不是恢复后的断点，然后再判断下一步是不是
-    p_flag=regs.rip;// 遇到我们的永久断点处理后改变标记位
+/* 改动21:s/x 的接力入口。
+ * 停在已恢复的永久断点上(restored==1)时,不能直接 CONT——0xCC 缺席,
+ * 要先单步把 CPU 抬过这条指令,重埋留给主循环的中转停(p_flag)。
+ * 一次 handler 只发一次放行请求:这里只 SINGLESTEP,CONT 在中转停分支里。
+ * 你 v7 草稿的 cmd_x 在 SINGLESTEP 后又接了一个 CONT——子进程还在跑,
+ * 第二个 ptrace 直接 ESRCH,而且就算生效也会冲过中转停 */
+int cmd_s(pid_t pid){
+  int q=bp_find(&p,regs.rip);   /* prompt 期间 rip 恒指向下一条待执行指令 */
+  if(q>=0&&p.items[q].restored){
+    p_flag=regs.rip;
+    p_from_x=0;                 /* s 来的:重埋后回 prompt */
     ptrace(PTRACE_SINGLESTEP,pid,0,0);
+    return 0;
+  }
+  ptrace(PTRACE_SINGLESTEP, pid, 0, 0); return 0; }
+int cmd_x(pid_t pid){
+  int q=bp_find(&p,regs.rip);
+  if(q>=0&&p.items[q].restored){//判断是不是恢复后的断点
+    p_flag=regs.rip;// 遇到我们的永久断点处理后改变标记位
+    p_from_x=1;                 /* x 来的:重埋后 CONT,中转停对用户隐身 */
+    ptrace(PTRACE_SINGLESTEP,pid,0,0);
+    return 0;//之前忘记了可以return 0这一说
   }
   ptrace(PTRACE_CONT,pid,0,0);
   return 0; }
@@ -303,6 +349,59 @@ int cmd_bt(pid_t pid){ /* 栈回溯核心留给你写(符号胶水已就绪):
   return 2;
 }
 
+/* 改动23:用户断点命令组。b 是设置类命令(没放行子进程)→ return 2。
+ * b main      → sym_find 查文件坐标,+g_base 换算后埋永久断点
+ * b *0x40115b → 星号开头 = 内存绝对地址,直接用不换算
+ * 注意:参数和命令可以不在同一行(scanf 读的是下一个token),但光秃秃一个 b
+ * 会把下一行命令吃掉当参数——已知限制,别这么用 */
+int cmd_b(pid_t pid){
+  char arg[64];
+  if(scanf("%63s", arg) != 1){ printf("用法: b <函数名> 或 b *<十六进制地址>\n"); return 2; }
+  unsigned long a;
+  if(arg[0] == '*'){
+    a = strtoul(arg + 1, NULL, 16);        /* *地址 = 内存绝对地址 */
+  }else{
+    a = sym_find(arg);
+    if(a == 0){ printf("ERR: 找不到符号 %s\n", arg); return 2; }
+    a += g_base;                           /* 文件坐标 → 内存地址 */
+  }
+  if(bp_find(&p, a) >= 0){ printf("该地址已有断点,忽略\n"); return 2; }
+  bp_install(pid, &p, a, 0);
+  printf("断点已下: ");
+  sym_print(a - g_base);                   /* 反方向换算回文件坐标再翻译 */
+  return 2;
+}
+
+/* 改动23:断点列表(info b 的简陋版,先不分参数) */
+int cmd_info(pid_t pid){
+  (void)pid;
+  for(int i = 0; i < p.count; i++){
+    if(!p.items[i].active) continue;
+    printf("#%d addr=0x%lx %s %s ", i, p.items[i].addr,
+           p.items[i].is_temp ? "临时" : "永久",
+           p.items[i].restored ? "已恢复" : "armed");
+    sym_print(p.items[i].addr - g_base);
+  }
+  return 2;
+}
+
+/* 改动23:按编号删断点。
+ * armed(restored==0)的断点删除前必须把原字节写回——否则雷留在内存里,
+ * 表项却没了,程序路过就无故 SIGTRAP(孤儿断点)。restored==1 的字节已恢复,只删表项 */
+int cmd_d(pid_t pid){
+  int idx;
+  if(scanf("%d", &idx) != 1 || idx < 0 || idx >= p.count || !p.items[idx].active){
+    printf("ERR: 无效的断点编号\n");
+    return 2;
+  }
+  if(!p.items[idx].restored){
+    mem_poke(pid, p.items[idx].addr, p.items[idx].save);
+  }
+  p.items[idx].active = 0;
+  printf("断点 #%d 已删除\n", idx);
+  return 2;
+}
+
 static const cmd_t CMDS[] = {
   {"s", cmd_s},
   {"x", cmd_x},
@@ -310,6 +409,9 @@ static const cmd_t CMDS[] = {
   {"n", cmd_n},//实现步过
   {"f", cmd_f},//实现步出，就是在函数内部的调试里面直接跳出去，主要利用rbp读取返回值，提前读取而已
   {"bt", cmd_bt},//栈回溯:顺 rbp 链爬出整条调用链
+  {"b", cmd_b},//改动23:下永久断点(b main / b *0x地址)
+  {"info", cmd_info},//改动23:断点列表
+  {"d", cmd_d},//改动23:按编号删断点
 };
 
 int main(int argc, char **argv) { // s是单步调试，x是放行，q是退出
@@ -326,7 +428,6 @@ int main(int argc, char **argv) { // s是单步调试，x是放行，q是退出
     exit(1);
   } else {
     unsigned long addr = 0;   /* 改动17:不再硬编码,首次停下时由 sym_find("main")+g_base 填入 */
-    int done = 0;
     int pid_main = 0;
     printf("wo shi fu jin cheng\n");
     int status;
@@ -341,19 +442,24 @@ int main(int argc, char **argv) { // s是单步调试，x是放行，q是退出
         exit(1);
       }
       if (WIFSTOPPED(status)) {
+        /* 改动22:中转停检查必须在所有分支最前面——单步完成和撞断点的 status
+         * 一模一样(都是 stopped by 5),只能靠 p_flag 认出中转站。
+         * 重埋后:x 立的标记 → CONT 回 waitpid(对用户隐身);
+         *        s 立的标记 → 落回 prompt(用户本来就要走一步停一下) */
+        if(p_flag){
+          int from_x=p_from_x;
+          bp_replant(pid,&p,p_flag);
+          p_flag=0;
+          if(from_x){
+            ptrace(PTRACE_CONT,pid,0,0);
+            continue;
+          }
+          ptrace(PTRACE_GETREGS,pid,0,&regs);
+          printf("前面第三次else的rip:%llx\n",regs.rip);
+        }else{
         printf("stopped by %d\n", WSTOPSIG(status));
         // ran hou zhe bian shi wo men dui yu cheng xu di zhi de ji sua
-        if(p_flag){//  重埋永久断点   重埋分支
-          ptrace(PTRACE_GETREGS,pid,0,&regs);
-          int idx=bp_find(&p,p_flag);
-          mem_poke(pid,p_flag,(p.items[idx].save & ~0xff)|0xcc);
-          bp_prestored(pid,&p,p_flag);
-          p_flag=0;
-          ptrace(PTRACE_CONT,pid,0,0);
-          continue;
-        }
-        if (!pid_main) { //  这一步有两个原因，其中一个是防止重复读取old导致字节码污染，然后就是在这边用上我们的pid_main用来标记并写入oxcc
-                         //  的，然后放行撞上断点
+        if (!pid_main) { //  初始化分支:加载符号+算基址+把 main 断点当普通永久断点埋下
           /* 改动17+18:入口断点地址不再硬编码 —— 先 sym_load 填符号表,再 sym_find("main")
            * 拿文件坐标,最后 +g_base 换算成内存地址。顺序必须如此(sym_find 依赖符号表),
            * 所以原来"先 bp_install 后 sym_load"的顺序对调了 */
@@ -369,32 +475,27 @@ int main(int argc, char **argv) { // s是单步调试，x是放行，q是退出
           }
           if(addr == 0){
             fprintf(stderr, "找不到 main 符号(目标被 strip 了?),本次不下入口断点\n");
-            done = 1;   /* 没埋雷就没人需要排雷,防止 !done 分支对空表 bp_restore */
           }else{
             bp_install(pid, &p, addr, 0);   /* 改动15:埋断点全项目只有这一个入口 */
           }
           pid_main = 1;
           ptrace(PTRACE_CONT, pid, 0, 0);
           continue;
-        } else if(!done){
-          ptrace(PTRACE_GETREGS, pid, 0, &regs);
-          regs.rip -= 1;
-
-          printf("这是done的rip=%llx\n", regs.rip);
-          ptrace(PTRACE_SETREGS, pid, 0, &regs);
-          /* 改动15:原字节从断点表 save 字段恢复(原 POKE old),old 变量废弃 */
-          bp_restore(pid, &p, addr);
-          done=1;
-          }else{
+        } else {
           ptrace(PTRACE_GETREGS,pid,0,&regs);
-          /* 改动14:命中检查+恢复收口进 bp_handle_hit。原来这里直接摸 p.items[] 内部字段;
-           * 命中时 regs.rip 已被函数内回退,下面两种打印和原行为逐字节一致 */
-          if(bp_handle_hit(pid, &p)){
+          /* 改动22:done/pid_main 特判删除——main 断点命中也走通用路径。
+           * bp_handle_hit 三态返回:1=temp(步过完成) 2=永久(交出现场) 0=普通单步 */
+          int r = bp_handle_hit(pid, &p);
+          if(r==1){
             printf("步过完成 rip=%llx\n",regs.rip);
+          }else if(r==2){
+            printf("命中永久断点: ");
+            sym_print(regs.rip - g_base);
           }else{
             printf("前面第三次else的rip:%llx\n",regs.rip);
           }
           }
+        }
          // =====================================================这上面的这段就是处理main开头的软断点的====================================
             // ptrace(
           /* 改动7:prompt包进小循环。unknown/q取消/n占位这类"没放行子进程"的情况
